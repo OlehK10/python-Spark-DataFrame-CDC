@@ -1,0 +1,271 @@
+import os
+import shutil
+from datetime import datetime, date
+from functools import wraps
+from itertools import groupby
+
+from pyspark.sql import DataFrame
+import pyspark
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.functions import udf
+from pyspark.sql.functions import col
+from pyspark.sql.types import IntegerType, StructType, StructField, StringType, DateType, FloatType
+
+
+
+class AnalitisCDC():
+    app_name = 'cdc'
+    # processing_date = 20230101
+    # target_path = f'Create parquet File v_key/file/people.parquet/partition={processing_date}'
+    target_pathALL = f'Create parquet File v_key/file/people.parquet'
+
+    def run(self):
+        spark = SparkSession.builder.appName(self.app_name).getOrCreate()
+
+        # 1 steps
+        df = AnalitisCDC.createDF(spark)
+        df = df.withColumn('partition', df.date)
+        df.show()
+        list_data = AnalitisCDC.var_date(df, 'date')
+
+        print("parquet")
+        df_load = AnalitisCDC.readDFParquet(spark, self.target_pathALL, df)
+        df_load.show()
+        list_data_PQ = AnalitisCDC.var_date(df_load, 'date')
+        print('list_data_PQ', list_data_PQ)
+        # -------------
+
+        # 2 steps
+        # list_for Del
+        key_fild = ["id", "dob"]
+        list_for_del = AnalitisCDC.list_for_del(df, df_load, key_fild)
+        print("list_for_del = ", list_for_del)
+
+        # 3 delete in parquet partition
+        AnalitisCDC.delete_in_parquet_partition(self.target_pathALL, list_for_del)
+
+        # 4 rewrite_parquet_partition
+        AnalitisCDC.rewrite_parquet_partition(df,self.target_pathALL, list_data, list_data_PQ)
+
+
+
+    @staticmethod
+    def createDF(spark) -> DataFrame:
+        data = [(1,"James", "", "Smith", "36636", "M", 3000, 20230101),
+                (2,"Michael", "Rose", "", "40288", "M", 4000, 20230101),
+                # (3,"Robert", "", "Williams", "42114", "M", 4000, 20230101),
+                # (4,"Maria", "Anne", "Jones", "39192", "F", 4000, 20230102),
+                # (5,"Jen", "Mary", "Brown", "", "F", -1, 20230102),
+                (6,"Jen1", "Mary1", "Brown1", "", "F", -2, 20230103),
+                (73,"Jen2", "Mary2", "Brown2", "7889", "F", -1, 20230103),
+                (8,"Jen3", "Mary3", "Brown3", "7884", "F", 100, 20230104),
+                (9,"Jen34", "Mary3", "Brown3", "7884", "F", -1, 20230104),
+                (10,"Jen5", "Mary3", "Brown3", "7884", "F", -1, 20230105),
+                (11,"Jen55", "Mary3", "Brown3", "7884", "F", -1, 20230105),
+                (12,"Jen555", "Mary3", "Brown3", "7884", "F", -1, 20230105),
+                (13,"Jen5555", "Mary3", "Brown3", "7884", "F", -1, 20230105),
+                (14,"Jen5555", "Mary3", "Brown3", "7884", "F", -1, 20230105)
+                ]
+        columns = StructType( \
+            [ \
+                StructField("id", IntegerType(), True),\
+                StructField("firstname", StringType(), True), \
+                StructField("middlename", StringType(), True), \
+                StructField("lastname", StringType(), True), \
+                StructField("dob", StringType(), True), \
+                StructField("gender", StringType(), True), \
+                StructField("salary", IntegerType(), True), \
+                StructField("date", IntegerType(), True) \
+                ])
+
+        df = spark.createDataFrame(data, columns)
+        return df
+
+    @staticmethod
+    def join_table(DEPT: DataFrame, EMP: DataFrame, joinExpression, jn = 'inner') -> DataFrame:
+
+        df_new = DEPT.join(EMP, joinExpression, jn ) #'leftouter'
+
+        return df_new
+
+    @staticmethod
+    def readDFParquet(spark, target_pathALL, df) -> DataFrame:
+        try:
+            parDF = spark.read.parquet(target_pathALL)
+        except:
+            # df = df.withColumn('partition', df.date)
+            df.coalesce(1).write.partitionBy('partition').mode("overwrite").parquet(
+                target_pathALL)
+            parDF = spark.read.parquet(target_pathALL)
+        return parDF
+
+    @staticmethod
+    def var_date(df: DataFrame, var_col) -> list:
+
+        states1 = df.rdd.map(lambda x: x[var_col]).collect()
+        states1 = [el for el, _ in groupby(states1)]  # remove duplicates
+        lst = [int(x) for x in states1]
+        return lst  # find_missing(lst)
+
+    @staticmethod
+    def list_for_del(df_sourse: DataFrame, df_parquet: DataFrame, key_fild: list) -> list:
+        # --- difference
+        df_sourse = AnalitisCDC.change_name_columns(df_sourse, 'df_sourse_')
+
+# zip
+        tem_df_g_list = [col for col in df_sourse.columns]
+        # print("tem_df_g_list = ", tem_df_g_list)
+        tem_ddf_parquet_list = [col for col in df_parquet.columns]
+        # print("tem_df_g_list = ", tem_ddf_load_g_list)
+        tem_df_g_load_g_list_zip = list(zip(tem_df_g_list, tem_ddf_parquet_list))
+        print("tem_df_g_load_g_list_zip = ", tem_df_g_load_g_list_zip)
+
+        # key_fild = ["id", "dob"]
+        key_fild_where = []
+        not_key_fild_where = []
+
+        cnt_key_fild = 0
+        cnt_not_key_fild_where = 0
+        cnt_not_key_fild_where_len = len(tem_df_g_load_g_list_zip )
+        cnt_key_fild_l = len(key_fild)
+
+        print("cnt_not_key_fild_where_len", cnt_not_key_fild_where_len)
+        print("cnt_key_fild_l", cnt_key_fild_l)
+        for tem in tem_df_g_load_g_list_zip:
+            if tem[1] in key_fild:
+                if cnt_key_fild != 0:
+                    key_fild_where.append('&')
+                cnt_key_fild += 1
+
+                key_fild_where.append(f"(df_sourse[" + "'" + str(tem[0]) + "'" + "] == df_parquet[" + "'" + str(tem[1]) + "'" + "])")
+                # print(tem[0], tem[1])
+
+            elif tem[1] not in  key_fild:
+                if cnt_not_key_fild_where == 0:
+                    not_key_fild_where.append('& (')
+                cnt_not_key_fild_where+=1
+                not_key_fild_where.append(f"(df_sourse["+"'"+str(tem[0])+"'"+"] != df_parquet["+"'"+str(tem[1])+"'"+"])")
+            #     # tem_s = tem_s + str((df_g[tem[0]] != df_parquet[tem[1]]))
+                if cnt_not_key_fild_where != cnt_not_key_fild_where_len-cnt_key_fild_l:
+                    not_key_fild_where.append('|')
+                else:
+                    not_key_fild_where.append(')')
+
+
+        key_fild_where_str = "" + " ".join(key_fild_where) + ""
+        source_df_where_join = "" + " ".join(not_key_fild_where) + ""
+        # res_where_str = "" + " ".join(res_where) + ""
+        res_where = '('+key_fild_where_str+')' +' '+ source_df_where_join
+
+        source_df = df_sourse.join(other=df_parquet, on= eval(res_where), how='inner')  # 'leftouter'
+
+        print("source_df_befor")
+        source_df = source_df.select([col for col in df_sourse.columns])
+        source_df.show()
+        source_df = AnalitisCDC.substr_name_columns(source_df, 'df_sourse_')
+
+        # print("join 2 Table")
+        print("source_df")
+        source_df.show()
+        # print("join 2 Table leftanti")
+        # source_df1 = AnalitisCDC.join_table(ddf_parquet, df_g, (df_g["df_g_id"] == df_parquet["id"]),
+        #                                     "leftanti")
+        source_df1 = AnalitisCDC.join_table(df_parquet, df_sourse, eval(key_fild_where_str),
+                                            "leftanti")
+        # source_df1.show()
+
+        # list for delete
+        # print("list for delete")
+        df_to_delete = source_df.union(source_df1)
+        # df_to_delete.show()
+        list_df_to_delete = AnalitisCDC.var_date(df_to_delete, 'partition')
+        # print("list for delete : ", list_df_to_delete)
+        return list_df_to_delete
+
+    @staticmethod
+    def delete_in_parquet_partition(target_pathALL, list_df_to_delete : list):
+        for value_for_del in list_df_to_delete:
+            # target_path = f'Create parquet File v2/file/people.parquet/partition={value_for_del}'
+            target_path = f'{target_pathALL}/partition={value_for_del}'
+            if os.path.exists(target_path):
+                shutil.rmtree(target_path)
+            else:
+                print("The file does not exist")
+
+    @staticmethod
+    def rewrite_parquet_partition(df: DataFrame, target_pathALL, list_data: list, list_data_PQ):
+        for list_d in list_data:
+            print('list_d', list_d)
+            if list_d not in list_data_PQ:
+
+                print(list_d)
+                processing_date = list_d
+                target_path = f'{target_pathALL}/partition={processing_date}'
+                dff = AnalitisCDC.createDFFilter(df, processing_date)
+                AnalitisCDC.sink(dff, target_path)
+
+
+    @staticmethod
+    def change_name_columns(VAR_DF: DataFrame, PREFIX_: str) -> DataFrame:
+        """
+        :param VAR_DF: :DataFrame
+        :param PREFIX_: : string <- the word to be added before the given column name
+        -------
+        :returns : DataFrame
+
+        -------
+        -------
+        Examples
+
+            VAR_DF : DataFrame
+
+            PREFIX_: DEPT_ <- the word to be added before the given column name
+
+        input:
+            ============ ==========
+            DEPTNO          EMP
+            ============ ==========
+                      1        4
+                      2        3
+            ============ ==========
+
+        out : DataFrame
+            ============ ==========
+            DEPT_DEPTNO  DEPT_EMP
+            ============ ==========
+                      1        4
+                      2        3
+            ============ ==========
+        """
+
+        for column in VAR_DF.columns:
+            # print('column = ', column)
+            new_column = column.replace(column, PREFIX_ + column)
+            VAR_DF = VAR_DF.withColumnRenamed(column, new_column)
+
+        return VAR_DF
+
+    @staticmethod
+    def substr_name_columns(VAR_DF: DataFrame, PREFIX_: str) -> DataFrame:
+        ln = len(PREFIX_)
+        print("ln = ", ln)
+        for column in VAR_DF.columns:
+            new_column = column.replace(column, column[ln:])
+            VAR_DF = VAR_DF.withColumnRenamed(column, new_column)
+
+        return VAR_DF
+
+    @staticmethod
+    def createDFFilter(df: DataFrame, processing_date) -> DataFrame:
+        df_filter = df.filter(F.col("date") == processing_date)
+        return df_filter
+
+    @staticmethod
+    def sink(df: DataFrame, target_path):
+        df.coalesce(1).write.mode('overwrite').parquet(target_path)
+
+if __name__ == '__main__':
+    # Get input parameters
+    a =AnalitisCDC()
+    a.run()
